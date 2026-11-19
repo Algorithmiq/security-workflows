@@ -1,7 +1,7 @@
 """Tests of scripts/dependency_scan.py, the scan of .github/workflows/dependency-scan.yml.
 
 Run with: uv run --no-project --with pytest --with pyyaml pytest
-The end-to-end tests need the network (PyPI, OSV and GitHub's advisory database).
+The end-to-end tests need the network (PyPI and OSV).
 """
 
 from __future__ import annotations
@@ -101,63 +101,110 @@ def test_invalid_exceptions(scan, tmp_path: Path, text: str, message: str) -> No
 # --- which findings block ---------------------------------------------------------------
 
 
-def finding(scan, id: str, aliases: list[str] | None = None):
-    return scan.Finding(
-        lock="uv.lock",
-        package="pkg",
-        version="1.0",
-        id=id,
-        aliases=aliases or [],
-        summary="A problem",
-        fix_versions=["1.1"],
-    )
+def osv_record(id: str, aliases: list[str], severity: str | None = None, **extra) -> dict:
+    record = {
+        "id": id,
+        "aliases": aliases,
+        "summary": f"Summary of {id}",
+        "affected": [
+            {
+                "package": {"name": "Pkg", "ecosystem": "PyPI"},
+                "ranges": [
+                    {"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "1.1"}]}
+                ],
+            }
+        ],
+        **extra,
+    }
+    if severity:
+        record["database_specific"] = {"severity": severity}
+    return record
 
 
-ADVISORIES = {
-    "GHSA-crit-crit-crit": {"severity": "critical", "withdrawn_at": None},
-    "GHSA-high-high-high": {"severity": "high", "withdrawn_at": None},
-    "GHSA-medi-medi-medi": {"severity": "medium", "withdrawn_at": None},
-    "GHSA-loww-loww-loww": {"severity": "low", "withdrawn_at": None},
-    "GHSA-gone-gone-gone": {
-        "severity": "critical",
-        "withdrawn_at": "2025-01-01T00:00:00Z",
-    },
+RECORDS = {
+    r["id"]: r
+    for r in [
+        osv_record("GHSA-crit-crit-crit", [], "CRITICAL"),
+        osv_record("GHSA-high-high-high", ["PYSEC-2020-1"], "HIGH"),
+        osv_record("PYSEC-2020-1", ["GHSA-high-high-high"]),
+        osv_record("GHSA-medi-medi-medi", [], "MODERATE"),
+        osv_record("GHSA-loww-loww-loww", [], "LOW"),
+        osv_record("PYSEC-2021-2", ["CVE-2021-2"]),
+        osv_record("PYSEC-2021-3", ["GHSA-only-alia-sed1"]),
+        osv_record("GHSA-only-alia-sed1", ["PYSEC-2021-3"], "MODERATE"),
+        osv_record("GHSA-gone-gone-gone", [], "CRITICAL", withdrawn="2025-01-01T00:00:00Z"),
+    ]
 }
 
 
-def fetch(ghsa: str) -> dict:
-    if ghsa not in ADVISORIES:
-        raise urllib.error.URLError("not found")
-    return ADVISORIES[ghsa]
+def fake_osv(scan, found: dict[tuple[str, str], list[str]]):
+    """An OSV whose batch query answers FOUND, by (name, version), and with RECORDS."""
+    queries = []
+
+    def post(url: str, body: dict) -> dict:
+        assert url.endswith("/querybatch")
+        queries.extend(body["queries"])
+        return {
+            "results": [
+                {"vulns": [{"id": i} for i in found.get((q["package"]["name"], q["version"]), [])]}
+                for q in body["queries"]
+            ]
+        }
+
+    def get(url: str) -> dict:
+        id = url.rsplit("/", 1)[1]
+        if id not in RECORDS:
+            raise urllib.error.URLError("not found")
+        return RECORDS[id]
+
+    osv = scan.Osv(post=post, get=get)
+    osv.queries = queries
+    return osv
+
+
+def scan_one(scan, ids: list[str], exceptions=()) -> list:
+    package = scan.Package("uv.lock", "pkg", "1.0")
+    osv = fake_osv(scan, {("pkg", "1.0"): ids})
+    findings = scan.find([package], osv)
+    scan.classify(findings, list(exceptions), osv)
+    return findings
 
 
 @pytest.mark.parametrize(
-    ("id", "aliases", "severity", "blocking"),
+    ("ids", "severity", "blocking"),
     [
-        ("GHSA-crit-crit-crit", [], "critical", True),
-        ("GHSA-high-high-high", [], "high", True),
-        ("GHSA-medi-medi-medi", [], "medium", False),
-        ("GHSA-loww-loww-loww", [], "low", False),
-        # uv shows the PYSEC id first for some advisories: the GHSA alias is used
-        ("PYSEC-2021-1", ["CVE-2021-1", "GHSA-medi-medi-medi"], "medium", False),
+        (["GHSA-crit-crit-crit"], "critical", True),
+        (["GHSA-high-high-high"], "high", True),
+        (["GHSA-medi-medi-medi"], "moderate", False),
+        (["GHSA-loww-loww-loww"], "low", False),
+        # only a PYSEC id, whose GHSA alias has the severity
+        (["PYSEC-2021-3"], "moderate", False),
         # no GHSA: the severity is unknown, which blocks
-        ("PYSEC-2021-2", ["CVE-2021-2"], "unknown", True),
-        # the advisory can't be read: unknown, which blocks
-        ("GHSA-miss-miss-miss", [], "unknown", True),
+        (["PYSEC-2021-2"], "unknown", True),
         # a withdrawn advisory never blocks
-        ("GHSA-gone-gone-gone", [], "critical", False),
+        (["GHSA-gone-gone-gone"], "critical", False),
     ],
 )
-def test_blocking(scan, id: str, aliases: list[str], severity: str, blocking: bool) -> None:
-    f = finding(scan, id, aliases)
-    scan.classify([f], [], fetch=fetch)
+def test_blocking(scan, ids: list[str], severity: str, blocking: bool) -> None:
+    [f] = scan_one(scan, ids)
     assert (f.severity, f.blocking) == (severity, blocking)
+
+
+def test_aliases_are_one_finding(scan) -> None:
+    """OSV lists a vulnerability once per database: the GHSA record is kept."""
+    [f] = scan_one(scan, ["PYSEC-2020-1", "GHSA-high-high-high"])
+    assert f.id == "GHSA-high-high-high"
+    assert f.fix_versions == ["1.1"]
+
+
+def test_an_unreadable_record_stops_the_scan(scan) -> None:
+    with pytest.raises(urllib.error.URLError):
+        scan_one(scan, ["GHSA-miss-miss-miss"])
 
 
 def test_an_exception_matches_an_alias(scan) -> None:
     approval = scan.Approval("CVE-2021-2", "https://e/1", "reason")
-    f = finding(scan, "PYSEC-2021-2", ["CVE-2021-2"])
-    scan.classify([f], [approval], fetch=fetch)
+    [f] = scan_one(scan, ["PYSEC-2021-2"], [approval])
     assert f.exception is approval
     assert approval.used
     assert not f.blocking
@@ -165,23 +212,56 @@ def test_an_exception_matches_an_alias(scan) -> None:
 
 def test_the_report_lists_unused_exceptions(scan) -> None:
     approval = scan.Approval("GHSA-none-none-none", "https://e/1", "reason")
-    f = finding(scan, "GHSA-high-high-high")
-    scan.classify([f], [approval], fetch=fetch)
-    text = scan.report([f], [approval], [], ["uv.lock"])
+    findings = scan_one(scan, ["GHSA-high-high-high"], [approval])
+    text = scan.report(findings, [approval], ["uv.lock"])
     assert "❌ blocking" in text
     assert "match no finding" in text
     assert "GHSA-none-none-none" in text
+
+
+def test_only_packages_from_an_index_are_looked_up(scan, tmp_path: Path) -> None:
+    lock = write(
+        tmp_path / "uv.lock",
+        """
+        version = 1
+        [[package]]
+        name = "demo"
+        version = "0.1.0"
+        source = { editable = "." }
+        [[package]]
+        name = "pkg"
+        version = "1.0"
+        source = { registry = "https://pypi.org/simple" }
+        [[package]]
+        name = "private"
+        version = "2.0"
+        source = { registry = "https://packages.example.com/simple/" }
+        [[package]]
+        name = "fromgit"
+        version = "0.3"
+        source = { git = "https://github.com/example/fromgit?rev=abc#abc" }
+        """,
+    )
+    packages = scan.locked_packages(lock, tmp_path)
+    assert [(p.name, p.version) for p in packages] == [("pkg", "1.0"), ("private", "2.0")]
+    osv = fake_osv(scan, {})
+    scan.find(packages, osv)
+    # only the name, the ecosystem and the version are sent
+    assert osv.queries == [
+        {"package": {"name": "pkg", "ecosystem": "PyPI"}, "version": "1.0"},
+        {"package": {"name": "private", "ecosystem": "PyPI"}, "version": "2.0"},
+    ]
 
 
 def test_workflow_command_messages_are_escaped(scan) -> None:
     assert scan.command("50% done\nnext") == "50%25 done%0Anext"
 
 
-# --- end to end: uv audit on real lock files ---------------------------------------------
+# --- end to end: real lock files and OSV --------------------------------------------------
 
 needs_network = pytest.mark.skipif(
     shutil.which("uv") is None or os.environ.get("OFFLINE") == "1",
-    reason="needs uv and the network",
+    reason="needs uv (to lock the projects) and the network",
 )
 
 

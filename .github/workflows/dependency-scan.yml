@@ -1,7 +1,7 @@
 name: Dependency scan
 
-# Checks the Python dependencies locked in uv.lock for known vulnerabilities, on every pull
-# request and in the merge queue. An organization ruleset requires it ("Require workflows to
+# Checks the Python packages locked in uv.lock against the OSV database of known
+# vulnerabilities, on every pull request and in the merge queue. An organization ruleset requires it ("Require workflows to
 # pass before merging"), so it runs in the repository of the pull request, with that
 # repository's files and token: see README.md.
 #
@@ -38,19 +38,15 @@ jobs:
           sparse-checkout: scripts
           persist-credentials: false
 
-      # No cache: the job must not restore files that another run could have written.
+      # runs the script with the Python of its inline metadata; no cache: the job must not
+      # restore files that another run could have written
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
-          # `uv audit` is a preview feature: its output can change between releases, so
-          # the version is pinned and moved on purpose.
-          version: "0.13.8"
           enable-cache: false
 
-      - name: Scan uv.lock for known vulnerabilities
+      - name: Check uv.lock against OSV
         env:
-          # reads the public advisory database: the token only raises the rate limit
-          GITHUB_TOKEN: ${{ github.token }}
           EXCEPTIONS_FILE: .github/vulnerability-exceptions.toml
-        # --no-config: the uv settings of the repository (uv.toml, [tool.uv]) apply to `uv
-        # audit`, which the script runs next to each uv.lock, but not to running the script
+        # --no-config: the uv settings of the repository (uv.toml, [tool.uv]) are not for the
+        # script, and --no-project: the repository's project isn't needed to run it
         run: uv run --no-config --no-project .dependency-scan/scripts/dependency_scan.py

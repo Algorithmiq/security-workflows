@@ -2,10 +2,12 @@
 # requires-python = ">=3.13"
 # dependencies = []
 # ///
-"""Scan the uv.lock files of the repository with `uv audit`.
+"""Check the packages locked in the uv.lock files of the repository against OSV.
 
-A finding blocks the merge when its advisory is high or critical, or when its
-severity can't be found, unless .github/vulnerability-exceptions.toml lists it.
+Each package from a package index is looked up by name and version in the OSV database
+(https://osv.dev), which is all that leaves the runner. A finding blocks the merge when its
+severity is high or critical, or unknown, unless .github/vulnerability-exceptions.toml lists
+it. The severity is GitHub's, from the GHSA records that OSV mirrors.
 """
 
 from __future__ import annotations
@@ -17,19 +19,14 @@ import sys
 import tomllib
 import urllib.error
 import urllib.request
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-BLOCKING = {"critical", "high"}
-AUDIT = [
-    "uv",
-    "audit",
-    "--frozen",
-    "--preview-features",
-    "audit-command,json-output",
-    "--output-format",
-    "json",
-]
+OSV = "https://api.osv.dev/v1"
+# OSV answers at most this many queries per batch
+BATCH = 1000
 
 
 class ScanError(Exception):
@@ -53,17 +50,84 @@ class Finding:
     aliases: list[str]
     summary: str
     fix_versions: list[str]
-    ghsa: str | None = None
     severity: str = "unknown"
     withdrawn: bool = False
     exception: Approval | None = None
-    ids: set[str] = field(default_factory=set)
+
+    @property
+    def ids(self) -> set[str]:
+        return {self.id, *self.aliases}
+
+    @property
+    def ghsa(self) -> str | None:
+        return next((i for i in [self.id, *self.aliases] if i.startswith("GHSA-")), None)
 
     @property
     def blocking(self) -> bool:
         if self.withdrawn or self.exception is not None:
             return False
-        return self.severity not in {"low", "medium", "moderate"}
+        return self.severity not in {"low", "moderate", "medium"}
+
+
+@dataclass(frozen=True)
+class Package:
+    lock: str
+    name: str
+    version: str
+
+
+@dataclass
+class Osv:
+    """OSV's API: the batch query, and the full records, read once each."""
+
+    post: Callable[[str, dict], dict]
+    get: Callable[[str], dict]
+    records: dict[str, dict] = field(default_factory=dict)
+
+    def vulnerabilities(self, packages: list[Package]) -> list[list[str]]:
+        """The ids of the vulnerabilities of each package, in the order of PACKAGES."""
+        ids: list[list[str]] = [[] for _ in packages]
+        pending = [(index, None) for index in range(len(packages))]
+        while pending:
+            batch, pending = pending[:BATCH], pending[BATCH:]
+            queries = [
+                {
+                    "package": {"name": packages[i].name, "ecosystem": "PyPI"},
+                    "version": packages[i].version,
+                    **({"page_token": token} if token else {}),
+                }
+                for i, token in batch
+            ]
+            results = self.post(f"{OSV}/querybatch", {"queries": queries})["results"]
+            for (index, _), result in zip(batch, results, strict=True):
+                ids[index] += [vuln["id"] for vuln in result.get("vulns", [])]
+                if result.get("next_page_token"):
+                    pending.append((index, result["next_page_token"]))
+        return ids
+
+    def record(self, id: str) -> dict:
+        if id not in self.records:
+            self.records[id] = self.get(f"{OSV}/vulns/{id}")
+        return self.records[id]
+
+    def prefetch(self, ids: set[str]) -> None:
+        missing = sorted(ids - set(self.records))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for id, record in zip(missing, pool.map(self.record, missing), strict=True):
+                self.records[id] = record
+
+
+def http_get(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=30) as response:
+        return json.load(response)
+
+
+def http_post(url: str, body: dict) -> dict:
+    request = urllib.request.Request(
+        url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.load(response)
 
 
 def load_exceptions(path: Path) -> list[Approval]:
@@ -107,70 +171,88 @@ def lock_files(root: Path) -> list[Path]:
     return sorted(root / name for name in output.split("\0") if name)
 
 
-def audit(lock: Path, root: Path) -> tuple[list[Finding], list[dict]]:
-    """Run `uv audit` next to LOCK and return its findings and adverse statuses."""
-    result = subprocess.run(AUDIT, cwd=lock.parent, capture_output=True, text=True, check=False)
-    # uv exits with 1 both for findings and for errors: the JSON tells them apart
+def locked_packages(lock: Path, root: Path) -> list[Package]:
+    """The packages of LOCK that come from a package index, with their versions.
+
+    The project itself and the packages from git, a URL or a local path have no version on
+    PyPI to look up, so they're left out.
+    """
     try:
-        report = json.loads(result.stdout)
-        vulnerabilities = report["vulnerabilities"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        raise ScanError(
-            f"`uv audit` failed for {lock.relative_to(root)}:\n{result.stderr.strip()}"
-        ) from None
+        data = tomllib.loads(lock.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as error:
+        raise ScanError(f"{lock.relative_to(root)} is not valid TOML: {error}") from error
     name = str(lock.relative_to(root))
-    findings = [
-        Finding(
-            lock=name,
-            package=item["dependency"]["name"],
-            version=item["dependency"]["version"],
-            id=item["id"],
-            aliases=list(item.get("aliases") or []),
-            summary=item.get("summary") or "",
-            fix_versions=list(item.get("fix_versions") or []),
-        )
-        for item in vulnerabilities
-    ]
-    return findings, list(report.get("adverse_statuses") or [])
-
-
-def fetch_advisory(ghsa: str) -> dict:
-    """Read one advisory from GitHub's database."""
-    request = urllib.request.Request(
-        f"https://api.github.com/advisories/{ghsa}",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            **(
-                {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"}
-                if os.environ.get("GITHUB_TOKEN")
-                else {}
-            ),
+    return sorted(
+        {
+            Package(name, package["name"], package["version"])
+            for package in data.get("package", [])
+            if "registry" in package.get("source", {}) and "version" in package
         },
+        key=lambda p: (p.name, p.version),
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)
 
 
-def classify(findings: list[Finding], exceptions: list[Approval], fetch=fetch_advisory) -> None:
+def normalize(name: str) -> str:
+    return name.lower().replace("_", "-").replace(".", "-")
+
+
+def fix_versions(record: dict, package: str) -> list[str]:
+    """The versions that fix RECORD for PACKAGE, from its affected ranges."""
+    return sorted(
+        {
+            event["fixed"]
+            for affected in record.get("affected", [])
+            if normalize(affected.get("package", {}).get("name", "")) == normalize(package)
+            for range_ in affected.get("ranges", [])
+            for event in range_.get("events", [])
+            if "fixed" in event
+        }
+    )
+
+
+def find(packages: list[Package], osv: Osv) -> list[Finding]:
+    """The vulnerabilities of PACKAGES, one finding per vulnerability and package.
+
+    OSV lists a vulnerability once per database (GHSA, PYSEC, …), the records naming each
+    other as aliases: the GHSA record is kept, as it has the severity.
+    """
+    ids = osv.vulnerabilities(packages)
+    osv.prefetch({i for found in ids for i in found})
+    findings = []
+    for package, found in zip(packages, ids, strict=True):
+        seen: set[str] = set()
+        for id in sorted(found, key=lambda i: (not i.startswith("GHSA-"), i)):
+            record = osv.record(id)
+            aliases = [a for a in record.get("aliases", []) if a != id]
+            if seen & {id, *aliases}:
+                continue
+            seen |= {id, *aliases}
+            findings.append(
+                Finding(
+                    lock=package.lock,
+                    package=package.name,
+                    version=package.version,
+                    id=id,
+                    aliases=aliases,
+                    summary=record.get("summary") or record.get("details", "").split("\n")[0],
+                    fix_versions=fix_versions(record, package.name),
+                    withdrawn=record.get("withdrawn") is not None,
+                )
+            )
+    return findings
+
+
+def classify(findings: list[Finding], exceptions: list[Approval], osv: Osv) -> None:
     """Fill in the severity and the exception of each finding."""
-    cache: dict[str, dict | None] = {}
     for finding in findings:
-        finding.ids = {finding.id, *finding.aliases}
-        finding.ghsa = next(
-            (i for i in [finding.id, *finding.aliases] if i.startswith("GHSA-")), None
-        )
         if finding.ghsa is not None:
-            if finding.ghsa not in cache:
-                try:
-                    cache[finding.ghsa] = fetch(finding.ghsa)
-                except (urllib.error.URLError, TimeoutError, ValueError) as error:
-                    print(f"::warning::Could not read {finding.ghsa}: {error}")
-                    cache[finding.ghsa] = None
-            advisory = cache[finding.ghsa]
-            if advisory is not None:
-                finding.severity = (advisory.get("severity") or "unknown").lower()
-                finding.withdrawn = advisory.get("withdrawn_at") is not None
+            try:
+                record = osv.record(finding.ghsa)
+            except (urllib.error.URLError, TimeoutError, ValueError) as error:
+                print(f"::warning::Could not read {finding.ghsa}: {error}")
+            else:
+                severity = (record.get("database_specific") or {}).get("severity")
+                finding.severity = (severity or "unknown").lower()
         for exception in exceptions:
             if exception.id in finding.ids:
                 finding.exception = exception
@@ -187,13 +269,11 @@ def cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
 
 
-def report(
-    findings: list[Finding], exceptions: list[Approval], statuses: list[str], locks: list[str]
-) -> str:
+def report(findings: list[Finding], exceptions: list[Approval], locks: list[str]) -> str:
     """The job summary, in Markdown."""
     blocking = [f for f in findings if f.blocking]
     lines = ["## Dependency scan", ""]
-    lines.append(f"Scanned {', '.join(f'`{lock}`' for lock in locks)} with `uv audit`.")
+    lines.append(f"Checked {', '.join(f'`{lock}`' for lock in locks)} against OSV.")
     lines.append("")
     if not findings:
         lines.append("No known vulnerabilities.")
@@ -208,9 +288,11 @@ def report(
             "|---|---|---|---|---|---|",
         ]
         order = {"critical": 0, "high": 1, "unknown": 2, "moderate": 3, "medium": 3, "low": 4}
-        for f in sorted(
-            findings, key=lambda f: (not f.blocking, order.get(f.severity, 2), f.package)
-        ):
+
+        def key(f: Finding) -> tuple:
+            return (not f.blocking, order.get(f.severity, 2), f.package)
+
+        for f in sorted(findings, key=key):
             if f.blocking:
                 status = "❌ blocking"
             elif f.withdrawn:
@@ -219,23 +301,20 @@ def report(
                 status = f"[excepted]({f.exception.issue})"
             else:
                 status = "reported"
-            advisory = f.ghsa or f.id
-            link = f"[{advisory}](https://github.com/advisories/{advisory})" if f.ghsa else advisory
+            link = f"[{f.id}](https://osv.dev/vulnerability/{f.id})"
+            fixed = cell(", ".join(f.fix_versions) or "no fix yet")
             lines.append(
                 f"| {status} | {cell(f.package)} {cell(f.version)} (`{f.lock}`) | {link} | "
-                f"{f.severity} | {cell(', '.join(f.fix_versions) or 'no fix yet')} | {cell(f.summary)} |"
+                f"{f.severity} | {fixed} | {cell(f.summary)} |"
             )
     unused = [e for e in exceptions if not e.used]
     if unused:
         lines += ["", "Exceptions that match no finding any more (remove them):", ""]
         lines += [f"- `{e.id}` ({e.issue})" for e in unused]
-    if statuses:
-        lines += ["", "Other problems that `uv audit` reports (not blocking):", ""]
-        lines += [f"- {cell(s)}" for s in statuses]
     return "\n".join(lines) + "\n"
 
 
-def main() -> int:
+def main(osv: Osv | None = None) -> int:
     root = Path.cwd()
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     locks = lock_files(root)
@@ -244,20 +323,20 @@ def main() -> int:
         if summary:
             Path(summary).write_text("## Dependency scan\n\nNo `uv.lock`: nothing to scan.\n")
         return 0
+    osv = osv or Osv(post=http_post, get=http_get)
+    exceptions_file = os.environ.get("EXCEPTIONS_FILE", ".github/vulnerability-exceptions.toml")
     try:
-        exceptions = load_exceptions(
-            root / os.environ.get("EXCEPTIONS_FILE", ".github/vulnerability-exceptions.toml")
-        )
-        findings, statuses = [], []
-        for lock in locks:
-            found, adverse = audit(lock, root)
-            findings += found
-            statuses += [f"`{lock.relative_to(root)}`: {json.dumps(s)}" for s in adverse]
+        exceptions = load_exceptions(root / exceptions_file)
+        packages = [package for lock in locks for package in locked_packages(lock, root)]
+        findings = find(packages, osv)
     except ScanError as error:
         print(f"::error title=Dependency scan::{command(str(error))}")
         return 1
-    classify(findings, exceptions)
-    text = report(findings, exceptions, statuses, [str(lock.relative_to(root)) for lock in locks])
+    except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as error:
+        print(f"::error title=Dependency scan::OSV could not be read: {command(str(error))}")
+        return 1
+    classify(findings, exceptions, osv)
+    text = report(findings, exceptions, [str(lock.relative_to(root)) for lock in locks])
     print(text)
     if summary:
         Path(summary).write_text(text)
@@ -266,7 +345,7 @@ def main() -> int:
             fix = f"fixed in {', '.join(f.fix_versions)}" if f.fix_versions else "no fix yet"
             print(
                 f"::error file={f.lock},title={f.severity} vulnerability in {f.package}::"
-                + command(f"{f.package} {f.version}: {f.ghsa or f.id} ({fix}). {f.summary}")
+                + command(f"{f.package} {f.version}: {f.id} ({fix}). {f.summary}")
             )
     for e in exceptions:
         if not e.used:
