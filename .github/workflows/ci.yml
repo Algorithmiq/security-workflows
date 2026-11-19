@@ -33,10 +33,10 @@ jobs:
       - name: Audit the workflows with zizmor
         run: uvx zizmor@1.32.0 --offline .github
 
-      - name: Lint and check the format of the tests with ruff
+      - name: Lint and check the format of the Python code with ruff
         run: |
-          uvx ruff@0.17.5 check tests
-          uvx ruff@0.17.5 format --check tests
+          uvx ruff@0.17.5 check scripts tests
+          uvx ruff@0.17.5 format --check scripts tests
 
   test:
     name: Test

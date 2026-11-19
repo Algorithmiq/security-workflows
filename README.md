@@ -17,7 +17,11 @@ locked in `uv.lock` for known vulnerabilities, on every pull request and in the 
 ### How it works
 
 A ruleset runs the workflow in the repository of the pull request, with that repository's
-files and `GITHUB_TOKEN` (read-only), and ignores the filters of its triggers. The job:
+files and `GITHUB_TOKEN` (read-only), and ignores the filters of its triggers. The scan is
+[`scripts/dependency_scan.py`](scripts/dependency_scan.py) of this repository: the job checks
+it out from the commit of the workflow file (`job.workflow_repository`, `job.workflow_sha`),
+which the ruleset pins, and runs it with `uv run` (Python 3.13, standard library only, as its
+inline metadata says). The script:
 
 1. finds the `uv.lock` files that git tracks. With none, it passes with a notice;
 2. runs [`uv audit`](https://docs.astral.sh/uv/) next to each one (`--frozen`: it reads the
@@ -82,13 +86,13 @@ doesn't move that pin: update it by hand, run the tests, and update the ruleset.
 
 ## Development
 
-The scan is the body of a workflow step (`shell: uv run … python {0}`), so the workflow is one
-self-contained file. The tests load the script from the workflow:
+The tests run `scripts/dependency_scan.py` as the workflow does:
 
 ```sh
-uv run --no-project --python 3.13 --with pytest --with pyyaml pytest
+uv run --no-project --with pytest --with pyyaml pytest
 ```
 
 The end-to-end tests lock small projects with known vulnerable packages and need the network
 (PyPI, OSV and GitHub's API); set `GITHUB_TOKEN` for a higher rate limit, and `OFFLINE=1` to
-skip them. Changes need a pull request and a review: every targeted repository runs this code.
+skip them. CI also runs ruff, actionlint and zizmor. Changes need a pull request and a review:
+every targeted repository runs this code.

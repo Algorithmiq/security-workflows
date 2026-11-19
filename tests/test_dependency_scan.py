@@ -1,7 +1,4 @@
-"""Tests of the script of .github/workflows/dependency-scan.yml.
-
-The script is the body of a step, so the tests take it from the workflow file: what they
-test is what runs.
+"""Tests of scripts/dependency_scan.py, the scan of .github/workflows/dependency-scan.yml.
 
 Run with: uv run --no-project --with pytest --with pyyaml pytest
 The end-to-end tests need the network (PyPI, OSV and GitHub's advisory database).
@@ -23,18 +20,24 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "dependency-scan.yml"
-
-
-def step() -> dict:
-    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-    return next(s for s in workflow["jobs"]["scan"]["steps"] if s.get("id") == "scan")
+SCRIPT = ROOT / "scripts" / "dependency_scan.py"
 
 
 @pytest.fixture(scope="session")
-def script(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    path = tmp_path_factory.mktemp("script") / "dependency_scan.py"
-    path.write_text(step()["run"], encoding="utf-8")
-    return path
+def script() -> Path:
+    return SCRIPT
+
+
+def test_the_workflow_runs_the_script() -> None:
+    """The workflow checks out this repository's scripts/ and runs the scan from there."""
+    steps = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["scan"]["steps"]
+    own = next(
+        s for s in steps if s.get("with", {}).get("repository") == "${{ job.workflow_repository }}"
+    )
+    assert own["with"]["ref"] == "${{ job.workflow_sha }}"
+    path = own["with"]["path"]
+    run = steps[-1]["run"]
+    assert run.endswith(f"{path}/{SCRIPT.relative_to(ROOT)}")
 
 
 @pytest.fixture(scope="session")
@@ -145,9 +148,7 @@ def fetch(ghsa: str) -> dict:
         ("GHSA-gone-gone-gone", [], "critical", False),
     ],
 )
-def test_blocking(
-    scan, id: str, aliases: list[str], severity: str, blocking: bool
-) -> None:
+def test_blocking(scan, id: str, aliases: list[str], severity: str, blocking: bool) -> None:
     f = finding(scan, id, aliases)
     scan.classify([f], [], fetch=fetch)
     assert (f.severity, f.blocking) == (severity, blocking)
@@ -211,7 +212,7 @@ def run(script: Path, cwd: Path) -> subprocess.CompletedProcess:
         "EXCEPTIONS_FILE": ".github/vulnerability-exceptions.toml",
     }
     result = subprocess.run(
-        ["uv", "run", "--no-project", "--python", "3.13", "python", str(script)],
+        ["uv", "run", "--no-config", "--no-project", str(script)],
         cwd=cwd,
         env=env,
         capture_output=True,
@@ -279,15 +280,3 @@ def test_every_tracked_lock_is_scanned(script: Path, tmp_path: Path) -> None:
     result = run(script, repository)
     assert result.returncode == 1, result.stdout + result.stderr
     assert "tools/uv.lock" in result.summary
-
-
-@pytest.mark.skipif(shutil.which("uvx") is None, reason="needs uvx")
-def test_the_script_passes_ruff(script: Path) -> None:
-    for command in (["check"], ["format", "--check"]):
-        result = subprocess.run(
-            ["uvx", "ruff@0.17.5", *command, "--line-length", "100", str(script)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
