@@ -1,0 +1,52 @@
+name: Dependency scan
+
+# Checks the Python packages locked in uv.lock against the OSV database of known
+# vulnerabilities, on every pull request and in the merge queue. An organization ruleset requires it ("Require workflows to
+# pass before merging"), so it runs in the repository of the pull request, with that
+# repository's files and token: see README.md.
+#
+# A ruleset ignores the filters of the triggers (branches, paths, types), so the job checks
+# by itself whether there is anything to scan. The scan is scripts/dependency_scan.py of this
+# repository, taken from the same commit as this file.
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Dependency scan
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    steps:
+      # the repository of the pull request, which the scan reads
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The script of the scan. With a ruleset, this workflow runs in another repository:
+      # `job.workflow_repository` and `job.workflow_sha` name this repository and the commit
+      # of this file, which the ruleset pins, so the script can't differ from the reviewed one.
+      # It goes next to the files of the pull request, untracked, so the scan doesn't see it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .dependency-scan
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      # runs the script with the Python of its inline metadata; no cache: the job must not
+      # restore files that another run could have written
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          enable-cache: false
+
+      - name: Check uv.lock against OSV
+        env:
+          EXCEPTIONS_FILE: .github/vulnerability-exceptions.toml
+        # --no-config: the uv settings of the repository (uv.toml, [tool.uv]) are not for the
+        # script, and --no-project: the repository's project isn't needed to run it
+        run: uv run --no-config --no-project .dependency-scan/scripts/dependency_scan.py

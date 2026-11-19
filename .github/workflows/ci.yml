@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# nothing by default: each job asks for the permissions it needs
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          enable-cache: false
+
+      - name: Check the workflows with actionlint
+        run: uvx --from actionlint-py==1.7.12.25 actionlint
+
+      - name: Audit the workflows with zizmor
+        run: uvx zizmor@1.32.0 --offline .github
+
+      - name: Lint and check the format of the Python code with ruff
+        run: |
+          uvx ruff@0.17.5 check scripts tests
+          uvx ruff@0.17.5 format --check scripts tests
+
+  test:
+    name: Test
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          enable-cache: false
+
+      - name: Run the tests
+        run: uv run --no-project --python 3.13 --with pytest==9.* --with pyyaml==6.* pytest -v
