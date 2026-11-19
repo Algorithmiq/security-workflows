@@ -257,6 +257,99 @@ def test_workflow_command_messages_are_escaped(scan) -> None:
     assert scan.command("50% done\nnext") == "50%25 done%0Anext"
 
 
+# --- runtime and development dependencies ------------------------------------------------
+
+LOCK = """
+version = 1
+[[package]]
+name = "demo"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "requests", extra = ["socks"] }, { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" } }]
+[package.optional-dependencies]
+plot = [{ name = "matplotlib" }]
+[package.dev-dependencies]
+test = [{ name = "pytest" }, { name = "requests" }]
+[[package]]
+name = "requests"
+version = "2.32.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "urllib3" }]
+[package.optional-dependencies]
+socks = [{ name = "pysocks" }]
+security = [{ name = "pyopenssl" }]
+[[package]]
+name = "urllib3"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+[[package]]
+name = "pysocks"
+version = "1.7.1"
+source = { registry = "https://pypi.org/simple" }
+[[package]]
+name = "pyopenssl"
+version = "24.0.0"
+source = { registry = "https://pypi.org/simple" }
+[[package]]
+name = "matplotlib"
+version = "3.9.0"
+source = { registry = "https://pypi.org/simple" }
+[[package]]
+name = "pytest"
+version = "8.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "pluggy" }]
+[[package]]
+name = "pluggy"
+version = "1.5.0"
+source = { registry = "https://pypi.org/simple" }
+[[package]]
+name = "scipy"
+version = "1.17.1"
+source = { registry = "https://pypi.org/simple" }
+[[package]]
+name = "scipy"
+version = "1.18.1"
+source = { registry = "https://pypi.org/simple" }
+"""
+
+
+def test_runtime_and_development_packages(scan, tmp_path: Path) -> None:
+    packages = scan.locked_packages(write(tmp_path / "uv.lock", LOCK), tmp_path)
+    runtime = {(p.name, p.version) for p in packages if p.runtime}
+    assert runtime == {
+        ("requests", "2.32.0"),
+        ("urllib3", "2.0.0"),  # a dependency of a dependency
+        ("pysocks", "1.7.1"),  # an extra that a dependency asks for
+        ("matplotlib", "3.9.0"),  # an extra of the project itself
+        ("scipy", "1.17.1"),  # only the version the project uses
+    }
+    development = {(p.name, p.version) for p in packages if not p.runtime}
+    # a dependency group, an extra nobody asks for, a version nobody at run time uses
+    assert development == {
+        ("pytest", "8.0.0"),
+        ("pluggy", "1.5.0"),
+        ("pyopenssl", "24.0.0"),
+        ("scipy", "1.18.1"),
+    }
+
+
+def test_without_a_project_every_package_counts(scan, tmp_path: Path) -> None:
+    lock = 'version = 1\n[[package]]\nname = "pkg"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+    [package] = scan.locked_packages(write(tmp_path / "uv.lock", lock), tmp_path)
+    assert package.runtime
+
+
+def test_development_findings_never_block(scan) -> None:
+    package = scan.Package("uv.lock", "pkg", "1.0", runtime=False)
+    osv = fake_osv(scan, {("pkg", "1.0"): ["GHSA-crit-crit-crit"]})
+    [f] = scan.find([package], osv)
+    scan.classify([f], [], osv)
+    assert f.severity == "critical"
+    assert not f.blocking
+    assert "| development |" in scan.report([f], [], ["uv.lock"])
+
+
 # --- end to end: real lock files and OSV --------------------------------------------------
 
 needs_network = pytest.mark.skipif(
@@ -349,6 +442,19 @@ def test_a_vulnerable_lock_fails_until_excepted(script: Path, tmp_path: Path) ->
     result = run(script, repository)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "excepted" in result.summary
+
+
+@needs_network
+def test_a_vulnerable_development_dependency_passes(script: Path, tmp_path: Path) -> None:
+    repository = project(tmp_path / "devonly", ["packaging>=25"])
+    with (repository / "pyproject.toml").open("a", encoding="utf-8") as file:
+        file.write('[dependency-groups]\ndev = ["jinja2==2.10"]\n')
+    subprocess.run(["uv", "lock", "--quiet"], cwd=repository, check=True)
+    git(repository, "add", "--all")
+    result = run(script, repository)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "| development |" in result.summary
+    assert "❌ blocking" not in result.summary
 
 
 @needs_network

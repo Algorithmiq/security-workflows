@@ -5,9 +5,11 @@
 """Check the packages locked in the uv.lock files of the repository against OSV.
 
 Each package from a package index is looked up by name and version in the OSV database
-(https://osv.dev), which is all that leaves the runner. A finding blocks the merge when its
-severity is high or critical, or unknown, unless .github/vulnerability-exceptions.toml lists
-it. The severity is GitHub's, from the GHSA records that OSV mirrors.
+(https://osv.dev), which is all that leaves the runner. A finding blocks the merge when it is
+in a runtime dependency and its severity is high or critical, or unknown, unless
+.github/vulnerability-exceptions.toml lists it. The severity is GitHub's, from the GHSA
+records that OSV mirrors. Findings in packages that only dependency groups (dev, test, docs,
+…) need are reported without blocking.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import sys
 import tomllib
 import urllib.error
 import urllib.request
+from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -50,6 +53,7 @@ class Finding:
     aliases: list[str]
     summary: str
     fix_versions: list[str]
+    runtime: bool = True
     severity: str = "unknown"
     withdrawn: bool = False
     exception: Approval | None = None
@@ -64,7 +68,7 @@ class Finding:
 
     @property
     def blocking(self) -> bool:
-        if self.withdrawn or self.exception is not None:
+        if not self.runtime or self.withdrawn or self.exception is not None:
             return False
         return self.severity not in {"low", "moderate", "medium"}
 
@@ -74,6 +78,7 @@ class Package:
     lock: str
     name: str
     version: str
+    runtime: bool = True
 
 
 @dataclass
@@ -171,6 +176,40 @@ def lock_files(root: Path) -> list[Path]:
     return sorted(root / name for name in output.split("\0") if name)
 
 
+def runtime_packages(packages: list[dict]) -> set[tuple[str, str | None]] | None:
+    """The (name, version) of the packages that the projects of a lock need at run time.
+
+    The walk starts from the projects (editable or virtual sources) with their extras, and
+    follows the dependencies, and the extras they ask for, but not the dependency groups.
+    Without a project, it returns None: every package counts as a runtime dependency.
+    """
+    by_name: dict[str, list[dict]] = defaultdict(list)
+    for package in packages:
+        by_name[package["name"]].append(package)
+    roots = [p for p in packages if {"editable", "virtual"} & set(p.get("source", {}))]
+    if not roots:
+        return None
+    pending = [(p, extra) for p in roots for extra in [None, *p.get("optional-dependencies", {})]]
+    seen: set[tuple[str, str | None, str | None]] = set()
+    while pending:
+        package, extra = pending.pop()
+        key = (package["name"], package.get("version"), extra)
+        if key in seen:
+            continue
+        seen.add(key)
+        if extra is None:
+            dependencies = package.get("dependencies", [])
+        else:
+            dependencies = package.get("optional-dependencies", {}).get(extra, [])
+        for dependency in dependencies:
+            for target in by_name[dependency["name"]]:
+                # with several versions locked, the dependency names the one it uses
+                if dependency.get("version", target.get("version")) != target.get("version"):
+                    continue
+                pending += [(target, x) for x in [None, *dependency.get("extra", [])]]
+    return {(name, version) for name, version, _ in seen}
+
+
 def locked_packages(lock: Path, root: Path) -> list[Package]:
     """The packages of LOCK that come from a package index, with their versions.
 
@@ -182,9 +221,15 @@ def locked_packages(lock: Path, root: Path) -> list[Package]:
     except tomllib.TOMLDecodeError as error:
         raise ScanError(f"{lock.relative_to(root)} is not valid TOML: {error}") from error
     name = str(lock.relative_to(root))
+    runtime = runtime_packages(data.get("package", []))
     return sorted(
         {
-            Package(name, package["name"], package["version"])
+            Package(
+                name,
+                package["name"],
+                package["version"],
+                runtime is None or (package["name"], package["version"]) in runtime,
+            )
             for package in data.get("package", [])
             if "registry" in package.get("source", {}) and "version" in package
         },
@@ -232,6 +277,7 @@ def find(packages: list[Package], osv: Osv) -> list[Finding]:
                     lock=package.lock,
                     package=package.name,
                     version=package.version,
+                    runtime=package.runtime,
                     id=id,
                     aliases=aliases,
                     summary=record.get("summary") or record.get("details", "").split("\n")[0],
@@ -279,13 +325,15 @@ def report(findings: list[Finding], exceptions: list[Approval], locks: list[str]
         lines.append("No known vulnerabilities.")
     else:
         lines.append(
-            f"{len(findings)} finding(s), {len(blocking)} blocking: high, critical or of "
-            "unknown severity, and not in `.github/vulnerability-exceptions.toml`."
+            f"{len(findings)} finding(s), {len(blocking)} blocking: in a runtime dependency, "
+            "high, critical or of unknown severity, and not in "
+            "`.github/vulnerability-exceptions.toml`. Findings in packages that only the "
+            "dependency groups need (dev, test, docs, …) don't block."
         )
         lines += [
             "",
-            "| | Package | Advisory | Severity | Fixed in | Summary |",
-            "|---|---|---|---|---|---|",
+            "| | Package | Needed at | Advisory | Severity | Fixed in | Summary |",
+            "|---|---|---|---|---|---|---|",
         ]
         order = {"critical": 0, "high": 1, "unknown": 2, "moderate": 3, "medium": 3, "low": 4}
 
@@ -303,9 +351,10 @@ def report(findings: list[Finding], exceptions: list[Approval], locks: list[str]
                 status = "reported"
             link = f"[{f.id}](https://osv.dev/vulnerability/{f.id})"
             fixed = cell(", ".join(f.fix_versions) or "no fix yet")
+            needed = "run time" if f.runtime else "development"
             lines.append(
-                f"| {status} | {cell(f.package)} {cell(f.version)} (`{f.lock}`) | {link} | "
-                f"{f.severity} | {fixed} | {cell(f.summary)} |"
+                f"| {status} | {cell(f.package)} {cell(f.version)} (`{f.lock}`) | {needed} | "
+                f"{link} | {f.severity} | {fixed} | {cell(f.summary)} |"
             )
     unused = [e for e in exceptions if not e.used]
     if unused:

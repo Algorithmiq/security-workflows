@@ -34,10 +34,18 @@ inline metadata says). The script:
 4. writes a table of the findings to the job summary, and an error annotation for each one
    that blocks.
 
-A finding **blocks the merge** when its severity is **high** or **critical**, or unknown (no
-GHSA record): an unknown severity never lets a vulnerability through. Low and moderate
-findings are listed without failing the job. A withdrawn advisory never blocks. If OSV can't
-be read, the job fails.
+A finding **blocks the merge** when it is in a **runtime dependency** and its severity is
+**high** or **critical**, or unknown (no GHSA record): an unknown severity never lets a
+vulnerability through. Low and moderate findings are listed without failing the job, and so
+are findings in packages that only the dependency groups need (`dev`, `test`, `docs`, …),
+which don't ship with the project. A withdrawn advisory never blocks. If OSV can't be read,
+the job fails.
+
+The runtime dependencies are those of the projects of the lock (its editable or virtual
+packages) and of their extras, followed through the lock, with the extras each dependency
+asks for. Whatever a project lists in `[project] dependencies` counts, even tools that only
+its developers use: move those to a dependency group. A lock without a project counts every
+package as a runtime dependency.
 
 ### What leaves the repository
 
