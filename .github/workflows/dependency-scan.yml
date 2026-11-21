@@ -1,9 +1,10 @@
 name: Dependency scan
 
-# Checks the Python packages locked in uv.lock against the OSV database of known
-# vulnerabilities, on every pull request and in the merge queue. An organization ruleset requires it ("Require workflows to
-# pass before merging"), so it runs in the repository of the pull request, with that
-# repository's files and token: see README.md.
+# Checks the Python packages locked in uv.lock and the Rust crates locked in Cargo.lock
+# against the OSV database of known vulnerabilities, on every pull request and in the merge
+# queue. An organization ruleset requires it ("Require workflows to pass before merging"), so
+# it runs in the repository of the pull request, with that repository's files and token: see
+# README.md.
 #
 # A ruleset ignores the filters of the triggers (branches, paths, types), so the job checks
 # by itself whether there is anything to scan. The scan is scripts/dependency_scan.py of this
@@ -44,7 +45,7 @@ jobs:
         with:
           enable-cache: false
 
-      - name: Check uv.lock against OSV
+      - name: Check uv.lock and Cargo.lock against OSV
         env:
           EXCEPTIONS_FILE: .github/vulnerability-exceptions.toml
         # --no-config: the uv settings of the repository (uv.toml, [tool.uv]) are not for the
