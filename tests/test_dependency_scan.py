@@ -350,6 +350,312 @@ def test_development_findings_never_block(scan) -> None:
     assert "| development |" in scan.report([f], [], ["uv.lock"])
 
 
+# --- Rust crates: Cargo.lock --------------------------------------------------------------
+
+
+def crate_record(
+    id: str,
+    aliases: list[str],
+    severity: str | None = None,
+    informational: str | None = None,
+    name: str = "krate",
+) -> dict:
+    """A record as OSV serves RustSec's and GitHub's advisories of a crate."""
+    record = {
+        "id": id,
+        "aliases": aliases,
+        "summary": f"Summary of {id}",
+        "affected": [
+            {
+                "package": {"name": name, "ecosystem": "crates.io"},
+                "ranges": [
+                    {"type": "SEMVER", "events": [{"introduced": "0.0.0-0"}, {"fixed": "0.2.0"}]}
+                ],
+                "database_specific": {"informational": informational},
+            }
+        ],
+    }
+    if severity:
+        record["database_specific"] = {"severity": severity}
+    return record
+
+
+RECORDS.update(
+    {
+        r["id"]: r
+        for r in [
+            crate_record("GHSA-cccc-cccc-cccc", ["RUSTSEC-2024-0001"], "HIGH"),
+            crate_record("RUSTSEC-2024-0001", ["GHSA-cccc-cccc-cccc"]),
+            # a RustSec vulnerability that GitHub doesn't know: the severity is unknown
+            crate_record("RUSTSEC-2024-0002", []),
+            # notices that aren't vulnerabilities, without a GHSA record
+            crate_record("RUSTSEC-2024-0003", [], informational="unmaintained"),
+            crate_record("RUSTSEC-2024-0004", [], informational="unsound"),
+            crate_record("RUSTSEC-2024-0005", [], informational="notice"),
+            # a notice that GitHub has an advisory for: GitHub's severity counts
+            crate_record("RUSTSEC-2024-0006", ["GHSA-nnnn-nnnn-nnnn"], informational="unsound"),
+            crate_record("GHSA-nnnn-nnnn-nnnn", ["RUSTSEC-2024-0006"], "CRITICAL"),
+        ]
+    }
+)
+
+CARGO_PACKAGES = """
+[[package]]
+name = "demo"
+version = "0.1.0"
+dependencies = ["krate", "foo_bar"]
+
+[[package]]
+name = "krate"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
+name = "foo_bar"
+version = "1.2.3"
+source = "sparse+https://index.crates.io/"
+
+[[package]]
+name = "fromgit"
+version = "0.3.0"
+source = "git+https://github.com/example/fromgit?rev=abc#abc"
+
+[[package]]
+name = "private"
+version = "2.0.0"
+source = "registry+https://packages.example.com/index"
+
+[[package]]
+name = "local"
+version = "0.5.0"
+"""
+
+
+@pytest.mark.parametrize("version", [3, 4])
+def test_only_crates_from_crates_io_are_looked_up(scan, tmp_path: Path, version: int) -> None:
+    """Lock versions 3 and 4 have the same tables; only crates.io crates are sent."""
+    lock = write(tmp_path / "Cargo.lock", f"version = {version}\n{CARGO_PACKAGES}")
+    packages = scan.locked_packages(lock, tmp_path)
+    assert [(p.name, p.version, p.ecosystem) for p in packages] == [
+        ("foo_bar", "1.2.3", "crates.io"),
+        ("krate", "0.1.0", "crates.io"),
+    ]
+    # Cargo.lock doesn't tell the dependency kinds: every crate counts as a runtime one
+    assert all(p.runtime for p in packages)
+    osv = fake_osv(scan, {})
+    scan.find(packages, osv)
+    assert osv.queries == [
+        {"package": {"name": "foo_bar", "ecosystem": "crates.io"}, "version": "1.2.3"},
+        {"package": {"name": "krate", "ecosystem": "crates.io"}, "version": "0.1.0"},
+    ]
+
+
+def test_a_crate_locked_twice_is_looked_up_once(scan, tmp_path: Path) -> None:
+    crate = (
+        '[[package]]\nname = "krate"\nversion = "{}"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+    )
+    lock = write(
+        tmp_path / "Cargo.lock", "version = 4\n" + crate.format("0.1.0") * 2 + crate.format("0.2.0")
+    )
+    assert [p.version for p in scan.locked_packages(lock, tmp_path)] == ["0.1.0", "0.2.0"]
+
+
+def test_an_invalid_cargo_lock_stops_the_scan(scan, tmp_path: Path) -> None:
+    with pytest.raises(scan.ScanError, match="Cargo.lock is not valid TOML"):
+        scan.locked_packages(write(tmp_path / "Cargo.lock", "[[package]\n"), tmp_path)
+
+
+def test_crate_names_are_compared_exactly(scan) -> None:
+    """Cargo tells foo-bar and foo_bar apart; Python names ignore the separators and case."""
+    record = crate_record("RUSTSEC-2024-0007", [], name="foo-bar")
+    assert scan.fix_versions(
+        record, scan.Package("Cargo.lock", "foo-bar", "0.1.0", True, "crates.io")
+    ) == ["0.2.0"]
+    assert (
+        scan.fix_versions(record, scan.Package("Cargo.lock", "foo_bar", "0.1.0", True, "crates.io"))
+        == []
+    )
+    assert (
+        scan.fix_versions(record, scan.Package("Cargo.lock", "Foo-Bar", "0.1.0", True, "crates.io"))
+        == []
+    )
+    python = osv_record("PYSEC-2020-9", [])
+    assert scan.fix_versions(python, scan.Package("uv.lock", "pkg", "1.0")) == ["1.1"]
+    # a record of another ecosystem isn't about a package of this one, even with the same name
+    assert (
+        scan.fix_versions(python, scan.Package("Cargo.lock", "Pkg", "1.0", True, "crates.io")) == []
+    )
+
+
+def scan_crate(scan, ids: list[str], exceptions=()) -> list:
+    package = scan.Package("rust/Cargo.lock", "krate", "0.1.0", ecosystem="crates.io")
+    osv = fake_osv(scan, {("krate", "0.1.0"): ids})
+    findings = scan.find([package], osv)
+    scan.classify(findings, list(exceptions), osv)
+    return findings
+
+
+@pytest.mark.parametrize(
+    ("ids", "severity", "blocking"),
+    [
+        # RustSec and GitHub list one vulnerability twice: GitHub's severity counts
+        (["RUSTSEC-2024-0001", "GHSA-cccc-cccc-cccc"], "high", True),
+        (["RUSTSEC-2024-0001"], "high", True),
+        # a vulnerability without a GHSA record has an unknown severity, which blocks
+        (["RUSTSEC-2024-0002"], "unknown", True),
+        # notices are reported with their kind, and never block
+        (["RUSTSEC-2024-0003"], "informational: unmaintained", False),
+        (["RUSTSEC-2024-0004"], "informational: unsound", False),
+        (["RUSTSEC-2024-0005"], "informational: notice", False),
+        # unless GitHub has a severity for them
+        (["RUSTSEC-2024-0006"], "critical", True),
+    ],
+)
+def test_blocking_crates(scan, ids: list[str], severity: str, blocking: bool) -> None:
+    [f] = scan_crate(scan, ids)
+    assert (f.severity, f.blocking) == (severity, blocking)
+
+
+def test_the_ghsa_record_of_a_crate_is_kept(scan) -> None:
+    [f] = scan_crate(scan, ["RUSTSEC-2024-0001", "GHSA-cccc-cccc-cccc"])
+    assert f.id == "GHSA-cccc-cccc-cccc"
+    assert f.aliases == ["RUSTSEC-2024-0001"]
+    assert f.fix_versions == ["0.2.0"]
+
+
+@pytest.mark.parametrize("id", ["RUSTSEC-2024-0001", "GHSA-cccc-cccc-cccc"])
+def test_an_exception_by_either_id_covers_a_crate(scan, id: str) -> None:
+    approval = scan.Approval(id, "https://e/1", "reason")
+    [f] = scan_crate(scan, ["RUSTSEC-2024-0001", "GHSA-cccc-cccc-cccc"], [approval])
+    assert f.exception is approval
+    assert approval.used
+    assert not f.blocking
+
+
+def test_a_blocking_unknown_crate_vulnerability_can_be_excepted(scan) -> None:
+    approval = scan.Approval("RUSTSEC-2024-0002", "https://e/1", "reason")
+    [f] = scan_crate(scan, ["RUSTSEC-2024-0002"], [approval])
+    assert f.severity == "unknown"
+    assert not f.blocking
+
+
+def test_the_report_of_a_lock_of_each_kind(scan) -> None:
+    package = scan.Package("rust/Cargo.lock", "krate", "0.1.0", ecosystem="crates.io")
+    osv = fake_osv(scan, {("krate", "0.1.0"): ["RUSTSEC-2024-0003", "RUSTSEC-2024-0002"]})
+    findings = scan.find([package], osv)
+    scan.classify(findings, [], osv)
+    text = scan.report(findings, [], ["uv.lock", "rust/Cargo.lock"])
+    assert "Python packages of `uv.lock` and the Rust crates of `rust/Cargo.lock`" in text
+    assert "every crate counts as a runtime dependency" in text
+    assert "| informational: unmaintained |" in text
+    assert "krate 0.1.0 (`rust/Cargo.lock`) | run time |" in text
+    # the blocking finding comes first, the notice last
+    assert text.index("RUSTSEC-2024-0002") < text.index("RUSTSEC-2024-0003")
+    only_python = scan.report([], [], ["uv.lock"])
+    assert "Checked the Python packages of `uv.lock` against OSV." in only_python
+    assert "Cargo.lock" not in only_python
+
+
+# --- the whole script on a repository, with a fake OSV ------------------------------------
+
+UV_LOCK = (
+    'version = 1\n[[package]]\nname = "pkg"\nversion = "1.0"\n'
+    'source = { registry = "https://pypi.org/simple" }\n'
+)
+CRATE_LOCK = (
+    'version = 4\n[[package]]\nname = "krate"\nversion = "0.1.0"\n'
+    'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+)
+
+
+def tracked_repository(path: Path, files: dict[str, str]) -> Path:
+    path.mkdir()
+    git(path, "init", "--quiet")
+    for name, text in files.items():
+        (path / name).parent.mkdir(parents=True, exist_ok=True)
+        (path / name).write_text(text, encoding="utf-8")
+    git(path, "add", "--all")
+    return path
+
+
+def run_main(scan, repository: Path, osv, monkeypatch, capsys) -> tuple[int, str, str]:
+    summary = repository.parent / f"{repository.name}-summary.md"
+    monkeypatch.chdir(repository)
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setenv("EXCEPTIONS_FILE", ".github/vulnerability-exceptions.toml")
+    code = scan.main(osv)
+    return code, capsys.readouterr().out, summary.read_text(encoding="utf-8")
+
+
+def test_the_locks_of_both_kinds_are_found(scan, tmp_path: Path) -> None:
+    repository = tracked_repository(
+        tmp_path / "repo",
+        {
+            "uv.lock": UV_LOCK,
+            "rust/Cargo.lock": CRATE_LOCK,
+            "Cargo.lock": CRATE_LOCK,
+            "docs/uv.lock": UV_LOCK,
+        },
+    )
+    # an untracked lock doesn't count
+    (repository / "other").mkdir()
+    (repository / "other" / "Cargo.lock").write_text(CRATE_LOCK, encoding="utf-8")
+    found = [str(p.relative_to(repository)) for p in scan.lock_files(repository)]
+    assert found == ["Cargo.lock", "docs/uv.lock", "rust/Cargo.lock", "uv.lock"]
+
+
+def test_a_repository_with_both_locks(scan, tmp_path: Path, monkeypatch, capsys) -> None:
+    repository = tracked_repository(
+        tmp_path / "mixed", {"uv.lock": UV_LOCK, "rust/Cargo.lock": CRATE_LOCK}
+    )
+    osv = fake_osv(
+        scan,
+        {("pkg", "1.0"): ["GHSA-medi-medi-medi"], ("krate", "0.1.0"): ["RUSTSEC-2024-0002"]},
+    )
+    code, out, summary = run_main(scan, repository, osv, monkeypatch, capsys)
+    assert code == 1
+    assert "::error file=rust/Cargo.lock,title=unknown vulnerability in krate::" in out
+    assert "krate 0.1.0: RUSTSEC-2024-0002 (fixed in 0.2.0)" in out
+    assert "Python packages of `uv.lock` and the Rust crates of `rust/Cargo.lock`" in summary
+    assert "| ❌ blocking | krate 0.1.0 (`rust/Cargo.lock`) | run time |" in summary
+    assert "| reported | pkg 1.0 (`uv.lock`) |" in summary
+    # each ecosystem is queried for its own packages
+    assert {(q["package"]["name"], q["package"]["ecosystem"]) for q in osv.queries} == {
+        ("pkg", "PyPI"),
+        ("krate", "crates.io"),
+    }
+
+
+def test_a_repository_with_only_a_cargo_lock(scan, tmp_path: Path, monkeypatch, capsys) -> None:
+    repository = tracked_repository(tmp_path / "rustonly", {"Cargo.lock": CRATE_LOCK})
+    osv = fake_osv(scan, {("krate", "0.1.0"): ["RUSTSEC-2024-0003"]})
+    code, out, summary = run_main(scan, repository, osv, monkeypatch, capsys)
+    assert code == 0
+    assert "::error" not in out
+    assert "Checked the Rust crates of `Cargo.lock` against OSV." in summary
+    assert "informational: unmaintained" in summary
+    assert "| reported |" in summary
+
+
+def test_a_crates_exception_passes_the_scan(scan, tmp_path: Path, monkeypatch, capsys) -> None:
+    repository = tracked_repository(
+        tmp_path / "excepted",
+        {
+            "rust/Cargo.lock": CRATE_LOCK,
+            ".github/vulnerability-exceptions.toml": (
+                '[[exception]]\nid = "RUSTSEC-2024-0002"\n'
+                'issue = "https://github.com/example/demo/issues/1"\nreason = "Test."\n'
+            ),
+        },
+    )
+    osv = fake_osv(scan, {("krate", "0.1.0"): ["RUSTSEC-2024-0002"]})
+    code, out, summary = run_main(scan, repository, osv, monkeypatch, capsys)
+    assert code == 0, out
+    assert "[excepted](https://github.com/example/demo/issues/1)" in summary
+
+
 # --- end to end: real lock files and OSV --------------------------------------------------
 
 needs_network = pytest.mark.skipif(
@@ -402,7 +708,8 @@ def test_nothing_to_scan(script: Path, tmp_path: Path) -> None:
     git(repository, "init", "--quiet")
     result = run(script, repository)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "nothing to scan" in result.stdout
+    assert "No uv.lock or Cargo.lock" in result.stdout
+    assert "nothing to scan" in result.summary
 
 
 @needs_network
@@ -466,3 +773,65 @@ def test_every_tracked_lock_is_scanned(script: Path, tmp_path: Path) -> None:
     result = run(script, repository)
     assert result.returncode == 1, result.stdout + result.stderr
     assert "tools/uv.lock" in result.summary
+
+
+def crate(name: str, version: str) -> str:
+    return (
+        f'\n[[package]]\nname = "{name}"\nversion = "{version}"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+    )
+
+
+@needs_network
+def test_an_unmaintained_crate_is_reported_without_blocking(script: Path, tmp_path: Path) -> None:
+    """instant 0.1.12 is unmaintained (RUSTSEC-2024-0384): a notice, with no GHSA record."""
+    lock = f"version = 4\n{crate('instant', '0.1.12')}"
+    result = run(script, tracked_repository(tmp_path / "instant", {"rust/Cargo.lock": lock}))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Checked the Rust crates of `rust/Cargo.lock` against OSV." in result.summary
+    assert "| reported | instant 0.1.12 (`rust/Cargo.lock`) | run time |" in result.summary
+    assert "RUSTSEC-2024-0384" in result.summary
+    assert "informational: unmaintained" in result.summary
+
+
+@needs_network
+def test_a_crate_advisory_is_one_finding_with_github_severity(script: Path, tmp_path: Path) -> None:
+    """RUSTSEC-2023-0071 and its two GHSA records are one finding, with the GHSA severity."""
+    lock = f"version = 4\n{crate('rsa', '0.9.6')}"
+    result = run(script, tracked_repository(tmp_path / "rsa", {"rust/Cargo.lock": lock}))
+    assert "rsa 0.9.6 (`rust/Cargo.lock`)" in result.summary
+    assert "[GHSA-" in result.summary
+    assert "RUSTSEC-2023-0071" not in result.summary
+    assert "| unknown |" not in result.summary
+
+
+@needs_network
+def test_a_vulnerable_crate_fails_until_excepted(script: Path, tmp_path: Path) -> None:
+    # pyo3 0.19.0 has a high-severity advisory (out-of-bounds read), among others
+    lock = f"version = 4\n{crate('pyo3', '0.19.0')}"
+    repository = tracked_repository(tmp_path / "pyo3", {"rust/Cargo.lock": lock})
+    result = run(script, repository)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "::error file=rust/Cargo.lock,title=high vulnerability in pyo3::" in result.stdout
+    assert "❌ blocking" in result.summary
+
+    ids = sorted(
+        {
+            line.split(": ", 1)[1].split(" ", 1)[0]
+            for line in result.stdout.splitlines()
+            if line.startswith("::error file=")
+        }
+    )
+    assert ids
+    exceptions = repository / ".github" / "vulnerability-exceptions.toml"
+    exceptions.parent.mkdir()
+    exceptions.write_text(
+        "".join(
+            f'[[exception]]\nid = "{i}"\nissue = "https://github.com/example/demo/issues/1"\nreason = "Test."\n\n'
+            for i in ids
+        ),
+        encoding="utf-8",
+    )
+    result = run(script, repository)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "excepted" in result.summary

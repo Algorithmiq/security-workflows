@@ -2,14 +2,15 @@
 # requires-python = ">=3.13"
 # dependencies = []
 # ///
-"""Check the packages locked in the uv.lock files of the repository against OSV.
+"""Check the packages locked in the uv.lock and Cargo.lock files of the repository against OSV.
 
-Each package from a package index is looked up by name and version in the OSV database
-(https://osv.dev), which is all that leaves the runner. A finding blocks the merge when it is
-in a runtime dependency and its severity is high or critical, or unknown, unless
-.github/vulnerability-exceptions.toml lists it. The severity is GitHub's, from the GHSA
-records that OSV mirrors. Findings in packages that only dependency groups (dev, test, docs,
-…) need are reported without blocking.
+Each Python package from a package index, and each Rust crate from crates.io, is looked up by
+name and version in the OSV database (https://osv.dev), which is all that leaves the runner.
+A finding blocks the merge when it is in a runtime dependency and its severity is high or
+critical, or unknown, unless .github/vulnerability-exceptions.toml lists it. The severity is
+GitHub's, from the GHSA records that OSV mirrors. Findings in packages that only dependency
+groups (dev, test, docs, …) need, and informational RustSec notices (unmaintained, unsound,
+notice) that have no GitHub severity, are reported without blocking.
 """
 
 from __future__ import annotations
@@ -28,6 +29,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 OSV = "https://api.osv.dev/v1"
+# the `source` of the crates of crates.io in Cargo.lock: the git index, and the sparse one
+CRATES_IO_SOURCES = {
+    "registry+https://github.com/rust-lang/crates.io-index",
+    "sparse+https://index.crates.io/",
+}
 # OSV answers at most this many queries per batch
 BATCH = 1000
 
@@ -44,6 +50,10 @@ class Approval:
     used: bool = False
 
 
+# the start of the severity of an informational notice, for example "informational: unmaintained"
+INFORMATIONAL = "informational"
+
+
 @dataclass
 class Finding:
     lock: str
@@ -55,6 +65,8 @@ class Finding:
     fix_versions: list[str]
     runtime: bool = True
     severity: str = "unknown"
+    # RustSec's kind of a notice that isn't a vulnerability: unmaintained, unsound or notice
+    informational: str | None = None
     withdrawn: bool = False
     exception: Approval | None = None
 
@@ -70,6 +82,8 @@ class Finding:
     def blocking(self) -> bool:
         if not self.runtime or self.withdrawn or self.exception is not None:
             return False
+        if self.severity.startswith(INFORMATIONAL):
+            return False
         return self.severity not in {"low", "moderate", "medium"}
 
 
@@ -79,6 +93,8 @@ class Package:
     name: str
     version: str
     runtime: bool = True
+    # OSV's name of the ecosystem: PyPI for uv.lock, crates.io for Cargo.lock
+    ecosystem: str = "PyPI"
 
 
 @dataclass
@@ -97,7 +113,7 @@ class Osv:
             batch, pending = pending[:BATCH], pending[BATCH:]
             queries = [
                 {
-                    "package": {"name": packages[i].name, "ecosystem": "PyPI"},
+                    "package": {"name": packages[i].name, "ecosystem": packages[i].ecosystem},
                     "version": packages[i].version,
                     **({"page_token": token} if token else {}),
                 }
@@ -165,9 +181,9 @@ def load_exceptions(path: Path) -> list[Approval]:
 
 
 def lock_files(root: Path) -> list[Path]:
-    """The uv.lock files tracked by git, so generated or ignored ones don't count."""
+    """The uv.lock and Cargo.lock files tracked by git, so generated or ignored ones don't count."""
     output = subprocess.run(
-        ["git", "ls-files", "-z", "--", "uv.lock", "*/uv.lock"],
+        ["git", "ls-files", "-z", "--", "uv.lock", "*/uv.lock", "Cargo.lock", "*/Cargo.lock"],
         cwd=root,
         check=True,
         capture_output=True,
@@ -210,16 +226,49 @@ def runtime_packages(packages: list[dict]) -> set[tuple[str, str | None]] | None
     return {(name, version) for name, version, _ in seen}
 
 
+def read_lock(lock: Path, root: Path) -> dict:
+    try:
+        return tomllib.loads(lock.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as error:
+        raise ScanError(f"{lock.relative_to(root)} is not valid TOML: {error}") from error
+
+
 def locked_packages(lock: Path, root: Path) -> list[Package]:
-    """The packages of LOCK that come from a package index, with their versions.
+    """The packages of LOCK, a uv.lock or a Cargo.lock, that OSV can look up."""
+    if lock.name == "Cargo.lock":
+        return locked_crates(lock, root)
+    return locked_python_packages(lock, root)
+
+
+def locked_crates(lock: Path, root: Path) -> list[Package]:
+    """The crates of the Cargo.lock LOCK that come from crates.io, with their versions.
+
+    The packages of the workspace have no source, and the crates from git, a path or another
+    registry may not be on crates.io: they're left out, and their names aren't sent. Version 3
+    and 4 of the lock have the same `[[package]]` tables with name, version and source.
+
+    Cargo.lock doesn't say which crates only the development or the build need (that depends
+    on the dependency kinds and features, which only cargo resolves), so every crate counts as
+    a runtime dependency.
+    """
+    name = str(lock.relative_to(root))
+    return sorted(
+        {
+            Package(name, package["name"], package["version"], ecosystem="crates.io")
+            for package in read_lock(lock, root).get("package", [])
+            if package.get("source") in CRATES_IO_SOURCES and "version" in package
+        },
+        key=lambda p: (p.name, p.version),
+    )
+
+
+def locked_python_packages(lock: Path, root: Path) -> list[Package]:
+    """The packages of the uv.lock LOCK that come from a package index, with their versions.
 
     The project itself and the packages from git, a URL or a local path have no version on
     PyPI to look up, so they're left out.
     """
-    try:
-        data = tomllib.loads(lock.read_text(encoding="utf-8"))
-    except tomllib.TOMLDecodeError as error:
-        raise ScanError(f"{lock.relative_to(root)} is not valid TOML: {error}") from error
+    data = read_lock(lock, root)
     name = str(lock.relative_to(root))
     runtime = runtime_packages(data.get("package", []))
     return sorted(
@@ -241,17 +290,52 @@ def normalize(name: str) -> str:
     return name.lower().replace("_", "-").replace(".", "-")
 
 
-def fix_versions(record: dict, package: str) -> list[str]:
+def affected_entries(record: dict, package: Package) -> list[dict]:
+    """The `affected` entries of RECORD that are about PACKAGE.
+
+    Python names are compared as PEP 503 does, with the case and the separators ignored. Crate
+    names are exact: cargo tells `foo-bar` and `foo_bar` apart, and so does OSV.
+    """
+
+    def same(name: str) -> bool:
+        if package.ecosystem == "crates.io":
+            return name == package.name
+        return normalize(name) == normalize(package.name)
+
+    return [
+        affected
+        for affected in record.get("affected", [])
+        if affected.get("package", {}).get("ecosystem") == package.ecosystem
+        and same(affected.get("package", {}).get("name", ""))
+    ]
+
+
+def fix_versions(record: dict, package: Package) -> list[str]:
     """The versions that fix RECORD for PACKAGE, from its affected ranges."""
     return sorted(
         {
             event["fixed"]
-            for affected in record.get("affected", [])
-            if normalize(affected.get("package", {}).get("name", "")) == normalize(package)
+            for affected in affected_entries(record, package)
             for range_ in affected.get("ranges", [])
             for event in range_.get("events", [])
             if "fixed" in event
         }
+    )
+
+
+def informational_kind(record: dict, package: Package) -> str | None:
+    """RustSec's kind of RECORD for PACKAGE (unmaintained, unsound, notice), if it has one.
+
+    RustSec marks the advisories that aren't about a vulnerability in
+    `affected[].database_specific.informational`, which is null for the others.
+    """
+    return next(
+        (
+            kind
+            for affected in affected_entries(record, package)
+            if (kind := (affected.get("database_specific") or {}).get("informational"))
+        ),
+        None,
     )
 
 
@@ -281,7 +365,8 @@ def find(packages: list[Package], osv: Osv) -> list[Finding]:
                     id=id,
                     aliases=aliases,
                     summary=record.get("summary") or record.get("details", "").split("\n")[0],
-                    fix_versions=fix_versions(record, package.name),
+                    fix_versions=fix_versions(record, package),
+                    informational=informational_kind(record, package),
                     withdrawn=record.get("withdrawn") is not None,
                 )
             )
@@ -289,9 +374,17 @@ def find(packages: list[Package], osv: Osv) -> list[Finding]:
 
 
 def classify(findings: list[Finding], exceptions: list[Approval], osv: Osv) -> None:
-    """Fill in the severity and the exception of each finding."""
+    """Fill in the severity and the exception of each finding.
+
+    The severity is GitHub's, from the GHSA record. A RustSec advisory that isn't about a
+    vulnerability has no GHSA record: its severity is its informational kind, and it doesn't
+    block. A RustSec vulnerability without a GHSA record has an unknown severity, which blocks.
+    """
     for finding in findings:
-        if finding.ghsa is not None:
+        if finding.ghsa is None:
+            if finding.informational:
+                finding.severity = f"{INFORMATIONAL}: {finding.informational}"
+        else:
             try:
                 record = osv.record(finding.ghsa)
             except (urllib.error.URLError, TimeoutError, ValueError) as error:
@@ -318,9 +411,23 @@ def cell(text: str) -> str:
 def report(findings: list[Finding], exceptions: list[Approval], locks: list[str]) -> str:
     """The job summary, in Markdown."""
     blocking = [f for f in findings if f.blocking]
+    python = [lock for lock in locks if Path(lock).name != "Cargo.lock"]
+    rust = [lock for lock in locks if Path(lock).name == "Cargo.lock"]
+    checked = [
+        f"the Python packages of {', '.join(f'`{lock}`' for lock in python)}" if python else "",
+        f"the Rust crates of {', '.join(f'`{lock}`' for lock in rust)}" if rust else "",
+    ]
     lines = ["## Dependency scan", ""]
-    lines.append(f"Checked {', '.join(f'`{lock}`' for lock in locks)} against OSV.")
+    lines.append(f"Checked {' and '.join(c for c in checked if c)} against OSV.")
     lines.append("")
+    if rust:
+        lines += [
+            (
+                "`Cargo.lock` doesn't say which crates only the development or the build need, "
+                "so every crate counts as a runtime dependency."
+            ),
+            "",
+        ]
     if not findings:
         lines.append("No known vulnerabilities.")
     else:
@@ -328,7 +435,8 @@ def report(findings: list[Finding], exceptions: list[Approval], locks: list[str]
             f"{len(findings)} finding(s), {len(blocking)} blocking: in a runtime dependency, "
             "high, critical or of unknown severity, and not in "
             "`.github/vulnerability-exceptions.toml`. Findings in packages that only the "
-            "dependency groups need (dev, test, docs, …) don't block."
+            "dependency groups need (dev, test, docs, …) don't block, and neither do the "
+            "informational notices of RustSec (unmaintained, unsound, notice)."
         )
         lines += [
             "",
@@ -338,6 +446,8 @@ def report(findings: list[Finding], exceptions: list[Approval], locks: list[str]
         order = {"critical": 0, "high": 1, "unknown": 2, "moderate": 3, "medium": 3, "low": 4}
 
         def key(f: Finding) -> tuple:
+            if f.severity.startswith(INFORMATIONAL):
+                return (not f.blocking, 5, f.package)
             return (not f.blocking, order.get(f.severity, 2), f.package)
 
         for f in sorted(findings, key=key):
@@ -368,9 +478,14 @@ def main(osv: Osv | None = None) -> int:
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     locks = lock_files(root)
     if not locks:
-        print("::notice title=Dependency scan::No uv.lock in this repository: nothing to scan.")
+        print(
+            "::notice title=Dependency scan::No uv.lock or Cargo.lock in this repository: "
+            "nothing to scan."
+        )
         if summary:
-            Path(summary).write_text("## Dependency scan\n\nNo `uv.lock`: nothing to scan.\n")
+            Path(summary).write_text(
+                "## Dependency scan\n\nNo `uv.lock` or `Cargo.lock`: nothing to scan.\n"
+            )
         return 0
     osv = osv or Osv(post=http_post, get=http_get)
     exceptions_file = os.environ.get("EXCEPTIONS_FILE", ".github/vulnerability-exceptions.toml")
